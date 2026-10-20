@@ -47,3 +47,35 @@ jobs:
           else
             if [ "$prev" = "failure" ]; then say "✅ apexfaucet.xyz loads again from outside."; fi
           fi
+
+      - name: Power the server on (Contabo API) when it has been down for a while
+        if: always() && steps.probe.outputs.fails != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_PRIVATE_CHAT_ID }}
+          CID: ${{ secrets.CONTABO_CLIENT_ID }}
+          CSEC: ${{ secrets.CONTABO_CLIENT_SECRET }}
+          CUSER: ${{ secrets.CONTABO_USER }}
+          CPASS: ${{ secrets.CONTABO_PASSWORD }}
+          INSTANCE: ${{ secrets.CONTABO_INSTANCE_ID }}
+        run: |
+          [ -n "$CID" ] && [ -n "$CPASS" ] && [ -n "$INSTANCE" ] || { echo "no Contabo secrets yet: alert only"; exit 0; }
+          say() { curl -s -m 20 "https://api.telegram.org/bot$TOKEN/sendMessage" -d chat_id="$CHAT" --data-urlencode text="$1" >/dev/null; }
+          # consecutive failed scheduled runs before this one (each is 5 minutes): act after 3 (15 min), reboot once after 8 (40 min)
+          n=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow watch --event schedule --status completed --limit 12 --json conclusion --jq '[.[]|.conclusion] | until(.[0] != "failure" or length==0; .[1:]) | length' 2>/dev/null || echo 0)
+          fails=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow watch --event schedule --status completed --limit 12 --json conclusion --jq 'reduce .[] as $r ({n:0,stop:false}; if .stop then . elif $r.conclusion=="failure" then .n+=1 else .stop=true end) | .n')
+          echo "consecutive failures before this run: $fails"
+          [ "$fails" -ge 2 ] || exit 0
+          access=$(curl -s -m 30 https://auth.contabo.com/auth/realms/contabo/protocol/openid-connect/token -d client_id="$CID" -d client_secret="$CSEC" --data-urlencode username="$CUSER" --data-urlencode password="$CPASS" -d grant_type=password | jq -r .access_token)
+          [ -n "$access" ] && [ "$access" != "null" ] || { say "⚠️ Contabo login failed from the watcher (wrong API password?)."; exit 0; }
+          api() { curl -s -m 30 -H "Authorization: Bearer $access" -H "x-request-id: $(cat /proc/sys/kernel/random/uuid)" -H "x-trace-id: apex-watch" "$@"; }
+          status=$(api "https://api.contabo.com/v1/compute/instances/$INSTANCE" | jq -r '.data[0].status')
+          echo "instance status: $status"
+          if [ "$status" = "stopped" ] || [ "$status" = "shutoff" ]; then
+            api -X POST "https://api.contabo.com/v1/compute/instances/$INSTANCE/actions/start" -H 'content-type: application/json' >/dev/null
+            say "🔌 The server was powered OFF at the hosting level. The watcher just sent a power-on through the Contabo API."
+          elif [ "$fails" -ge 7 ]; then
+            api -X POST "https://api.contabo.com/v1/compute/instances/$INSTANCE/actions/restart" -H 'content-type: application/json' >/dev/null
+            say "🔁 The server has been unreachable for ~40 minutes while the hosting layer says it is $status. The watcher sent ONE restart through the Contabo API."
+          fi
