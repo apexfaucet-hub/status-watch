@@ -1,0 +1,49 @@
+name: watch
+# An independent watcher: it runs on GitHub, not on our server, so it still works when the server is off. Every 5 minutes it loads the real site the way a
+# visitor does. If something fails twice it tells the private Telegram channel once (not every 5 minutes) and tells it again when the site is back.
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+permissions:
+  actions: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Load the site like a visitor
+        id: probe
+        run: |
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/129 Safari/537.36'
+          probe() { # url min_bytes pattern
+            for try in 1 2; do
+              out=$(curl -s -m 20 -A "$UA" -w '\n%{http_code} %{time_total}' "$1") ; code=$(echo "$out" | tail -1 | cut -d' ' -f1); secs=$(echo "$out" | tail -1 | cut -d' ' -f2)
+              body=$(echo "$out" | sed '$d'); len=${#body}
+              if [ "$code" = "200" ] && [ "$len" -ge "$2" ] && echo "$body" | grep -q "$3"; then echo "ok $1 ${secs}s"; return 0; fi
+              sleep 20
+            done
+            echo "FAIL $1 (http $code, $len bytes)"; return 1
+          }
+          fails=""
+          probe https://apexfaucet.xyz/ 20000 APEX || fails="$fails home;"
+          probe https://apexfaucet.xyz/arc/bloodstream/ 20000 Bloodstream || fails="$fails game;"
+          probe https://apexfaucet.xyz/api/bloodstream/stats 200 settledLaunches || fails="$fails api;"
+          probe https://apexfaucet.xyz/arc/city/ 100000 "Agent City" || fails="$fails city;"
+          probe https://apexfaucet.xyz/.well-known/x402 200 x402 || fails="$fails x402;"
+          echo "fails=$fails" >> "$GITHUB_OUTPUT"
+      - name: Tell Telegram once, and when it recovers
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_PRIVATE_CHAT_ID }}
+          GH_TOKEN: ${{ github.token }}
+          FAILS: ${{ steps.probe.outputs.fails }}
+        run: |
+          prev=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow watch --event schedule --status completed --limit 1 --json conclusion --jq '.[0].conclusion' 2>/dev/null || echo success)
+          say() { curl -s -m 20 "https://api.telegram.org/bot$TOKEN/sendMessage" -d chat_id="$CHAT" --data-urlencode text="$1" >/dev/null; }
+          if [ -n "$FAILS" ]; then
+            if [ "$prev" != "failure" ]; then say "🔴 apexfaucet.xyz is NOT loading properly from outside: $FAILS (checked from GitHub; the server's own self-heal may already be fixing it). Next message when it is back."; fi
+            exit 1
+          else
+            if [ "$prev" = "failure" ]; then say "✅ apexfaucet.xyz loads again from outside."; fi
+          fi
